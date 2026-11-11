@@ -183,7 +183,8 @@ class PickupDelivery:
         # TODO: return (bundles, []). The merge_step block is not written for My Algorithm.
         # Savings에서 출발하여 합치기, 주문 이동, 교환을 반복한다.
         # 개선이 멈추면 일부 번들을 풀고 다시 탐색한다. 난수는 사용하지 않는다.
-        # 최고 기록이 30초 동안 바뀌지 않으면 처음 해로 돌아가 흔드는 시작 위치를 바꿔 다시 탐색한다.
+        # 이번 탐색의 최고 기록이 30초 동안 개선되지 않으면,
+        # 최초 지역 탐색 결과로 돌아가 흔들기 시작 위치를 바꾼다.
         end_time = time.perf_counter() + max(0, TIME_LIMIT - 40)
         n = len(self.orders)
         dist = self.dist
@@ -311,7 +312,7 @@ class PickupDelivery:
                 result.append(best_bike)
 
             # 저장 공간이 계속 커지는 것을 막는다.
-            if len(cache) >= 1000000:
+            if len(cache) >= 20000:
                 cache.clear()
 
             cache[key] = result
@@ -431,11 +432,11 @@ class PickupDelivery:
                             if merged is not None:
                                 candidates.append(merged)
 
-                    # B의 주문을 A에 하나씩 가장 싼 위치로 끼워 넣어서 합치는 방법도 시도한다.
-                    merged = insert_all(A, B)
-
-                    if merged is not None:
-                        candidates.append(merged)
+                    # 한 번들의 주문을 다른 번들에 하나씩 가장 싼 위치로 끼워 넣어서 합치는 방법도
+                    # B -> A, A -> B 두 방향 모두 시도한다.
+                    for merged in [insert_all(A, B), insert_all(B, A)]:
+                        if merged is not None:
+                            candidates.append(merged)
 
                     for merged in candidates:
                         new = replace(sol, [a, b], [merged])
@@ -596,8 +597,8 @@ class PickupDelivery:
             # 이번 탐색의 최고 기록보다 1% 넘게 나쁘면 그 기록으로 돌아간다.
             sol = new if cost <= run_cost * 1.01 else run_best
 
-            # 30초 동안 이번 탐색의 기록이 안 바뀌면 탐색이 멈춘 것으로 보고,
-            # 처음 해로 돌아가 흔들기 시작 위치를 n/3만큼 옮겨 새로 탐색한다.
+            # 이번 탐색의 최고 기록이 30초 동안 개선되지 않으면 탐색이 멈춘 것으로 보고,
+            # 최초 지역 탐색 결과로 돌아가 흔들기 시작 위치를 n/3만큼 옮겨 새로 탐색한다.
             if time.perf_counter() - last_improve > 30:
                 offset += n // 3 + 1
                 step = 0
