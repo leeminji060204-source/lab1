@@ -181,316 +181,480 @@ class PickupDelivery:
 
     def solve_my(self):
         # TODO: return (bundles, []). The merge_step block is not written for My Algorithm.
-        # My Algorithm: Savings 해에서 출발하는 지역 탐색 + 흔들기
-        #   1) 개선: 합치기 / 주문 이동 / 주문 교환 중 총비용이 줄어드는 것을 계속 적용
-        #   2) 흔들기: 더 이상 좋아지지 않으면 가까운 번들 몇 개를 1개짜리로 풀고 다시 1)
-        #   3) 시간이 끝나면 가장 좋았던 해에 라이더를 배정해서 반환
-        start = time.perf_counter()
-        end_time = start + TIME_LIMIT - 40      # 40초 여유를 두고 종료
+        # Savings에서 출발하여 합치기, 주문 이동, 교환을 반복한다.
+        # 개선이 멈추면 일부 번들을 풀고 다시 탐색한다. 난수는 사용하지 않는다.
+        # 최고 기록이 30초 동안 바뀌지 않으면 처음 해로 돌아가 흔드는 시작 위치를 바꿔 다시 탐색한다.
+        end_time = time.perf_counter() + max(0, TIME_LIMIT - 40)
         n = len(self.orders)
         dist = self.dist
-        riders = {}
-        for r in self.riders:
-            riders[r.rider_type] = r
+        riders = {r.rider_type: r for r in self.riders}
         car, bike = riders['CAR'], riders['BIKE']
-        ready = [o.ready_time for o in self.orders]
-        deadline = [o.deadline for o in self.orders]
-        volume = [o.volume for o in self.orders]
-        # 타입별 이동시간 행렬: round(distance / speed)
-        ttime = {}
+
+        orders = sorted(self.orders, key=lambda o: o.order_id)
+        ready = [o.ready_time for o in orders]
+        deadline = [o.deadline for o in orders]
+        volume = [o.volume for o in orders]
+
+        # 같은 이동시간을 반복해서 계산하지 않도록 미리 저장한다.
+        travel = {}
         for name in riders:
-            ttime[name] = [[round(d / riders[name].speed) for d in row] for row in dist]
+            travel[name] = [
+                [round(d / riders[name].speed) for d in row]
+                for row in dist
+            ]
 
-        def route_check(pickups, deliveries, rider):
-            """경로가 실행 가능하면 이동거리, 불가능하면 None"""
-            if sum(volume[o] for o in pickups) > rider.capacity:
+        def route_cost(p, d, rider):
+            # 첫 픽업의 준비 완료 시각에 출발한다.
+            # 이후 픽업 장소에 일찍 도착하면 준비 완료까지 기다린다.
+            if not p or sum(volume[i] for i in p) > rider.capacity:
                 return None
-            T = ttime[rider.rider_type]
-            prev = pickups[0]
-            t = ready[prev]                     # 첫 픽업 장소를 ready time에 출발
-            d = 0
-            for o in pickups[1:]:
-                t += T[prev][o]
-                d += dist[prev][o]
-                if t < ready[o]:                # 일찍 도착하면 대기
-                    t = ready[o]
-                prev = o
-            for o in deliveries:
-                t += T[prev][o + n]
-                d += dist[prev][o + n]
-                if t > deadline[o]:             # 마감시간 위반
+
+            prev = p[0]
+            now = ready[prev]
+            length = 0
+            T = travel[rider.rider_type]
+
+            for i in p[1:]:
+                now = max(now + T[prev][i], ready[i])
+                length += dist[prev][i]
+                prev = i
+
+            for i in d:
+                # 배달 위치는 거리 행렬에서 주문 번호 + n이다.
+                now += T[prev][i + n]
+                length += dist[prev][i + n]
+
+                if now > deadline[i]:
                     return None
-                prev = o + n
-            return d
 
-        def make(pickups, deliveries):
-            """번들(딕셔너리) 생성: 경로와 CAR/BIKE 비용 (불가능한 타입은 None). 둘 다 불가능하면 None"""
-            dc = route_check(pickups, deliveries, car)
-            db = route_check(pickups, deliveries, bike)
-            if dc is None and db is None:
+                prev = i + n
+
+            return rider.fixed_cost + rider.variable_cost * length / 100
+
+        def make(p, d):
+            # 두 라이더의 실행 가능 여부와 비용을 함께 저장한다.
+            cc = route_cost(p, d, car)
+            cb = route_cost(p, d, bike)
+
+            if cc is None and cb is None:
                 return None
-            cc = None if dc is None else car.fixed_cost + car.variable_cost * dc / 100
-            cb = None if db is None else bike.fixed_cost + bike.variable_cost * db / 100
-            return {'p': pickups, 'd': deliveries, 'cc': cc, 'cb': cb}
 
-        def score(b):
-            """경로 비교용 비용: 가능한 타입 중 더 싼 비용"""
-            if b['cc'] is None:
-                return b['cb']
-            if b['cb'] is not None and b['cb'] < b['cc']:
-                return b['cb']
-            return b['cc']
+            return {'p': p, 'd': d, 'cc': cc, 'cb': cb}
 
-        def total_cost(sol):
-            """해의 총비용: CAR로 불가능한 번들은 무조건 BIKE.
-            나머지는 CAR라고 보고, BIKE로 바꾸면 이득인 번들을 이득이 큰 순서로 남은 BIKE 대수만큼 바꾼다"""
-            total = 0
-            need_bike = 0
+        def total(sol):
+            # 반드시 BIKE가 필요한 번들에 먼저 배정한다.
+            # 나머지는 CAR 대비 절약액이 큰 순서로 BIKE를 배정한다.
+            cost, forced = 0, 0
             gains = []
+
             for b in sol:
                 if b['cc'] is None:
-                    total += b['cb']
-                    need_bike += 1
+                    cost += b['cb']
+                    forced += 1
                 else:
-                    total += b['cc']
+                    cost += b['cc']
+
                     if b['cb'] is not None and b['cb'] < b['cc']:
                         gains.append(b['cc'] - b['cb'])
-            left = bike.available - need_bike
-            if left < 0:                            # BIKE가 모자라면 불가능한 해
+
+            left = bike.available - forced
+
+            if left < 0:
                 return float('inf')
+
             gains.sort(reverse=True)
-            return total - sum(gains[:left])
+            return cost - sum(gains[:left])
 
-        insert_memo = {}                            # (번들 경로, 주문) -> best_insert 결과 저장
+        cache = {}
 
-        def best_insert(b, i):
-            """번들 b에 주문 i를 넣는 가장 싼 방법 (픽업 위치 x 배달 위치 모두 시도)"""
+        def insert(b, i):
+            # 모든 픽업/배달 삽입 위치를 검사한다.
+            # CAR 최저비용 경로와 BIKE 최저비용 경로를 각각 남긴다.
             if b is None:
-                return make([i], [i])
+                single = make([i], [i])
+                return [] if single is None else [single]
+
             key = (tuple(b['p']), tuple(b['d']), i)
-            if key in insert_memo:                  # 이미 계산한 적 있으면 저장된 결과 사용
-                return insert_memo[key]
-            if len(insert_memo) > 2000000:          # 메모리 보호
-                insert_memo.clear()
-            best = None
-            for pi in range(len(b['p']) + 1):
-                pickups = b['p'][:pi] + [i] + b['p'][pi:]
-                for di in range(len(b['d']) + 1):
-                    deliveries = b['d'][:di] + [i] + b['d'][di:]
-                    cand = make(pickups, deliveries)
-                    if cand is not None and (best is None or score(cand) < score(best)):
-                        best = cand
-            insert_memo[key] = best
-            return best
+
+            if key in cache:
+                return cache[key]
+
+            best_car, best_bike = None, None
+
+            for x in range(len(b['p']) + 1):
+                for y in range(len(b['d']) + 1):
+                    if time.perf_counter() >= end_time:
+                        # 중단한 계산은 완성된 결과처럼 저장하지 않는다.
+                        return []
+
+                    p = b['p'][:x] + [i] + b['p'][x:]
+                    d = b['d'][:y] + [i] + b['d'][y:]
+                    c = make(p, d)
+
+                    if c is None:
+                        continue
+
+                    if c['cc'] is not None:
+                        if best_car is None or c['cc'] < best_car['cc']:
+                            best_car = c
+
+                    if c['cb'] is not None:
+                        if best_bike is None or c['cb'] < best_bike['cb']:
+                            best_bike = c
+
+            result = []
+
+            if best_car is not None:
+                result.append(best_car)
+
+            if best_bike is not None and best_bike != best_car:
+                result.append(best_bike)
+
+            # 저장 공간이 계속 커지는 것을 막는다.
+            if len(cache) >= 1000000:
+                cache.clear()
+
+            cache[key] = result
+            return result
 
         def remove(b, i):
-            """번들 b에서 주문 i를 뺀 번들. 비면 None, 빼서 불가능해지면 False"""
-            pickups = [o for o in b['p'] if o != i]
-            if not pickups:
-                return None
-            deliveries = [o for o in b['d'] if o != i]
-            cand = make(pickups, deliveries)
-            return False if cand is None else cand
+            p = [o for o in b['p'] if o != i]
 
-        def merge(a, b):
-            """두 번들을 합치는 가장 싼 방법:
-            Savings처럼 앞뒤로 붙이는 4가지 + b의 주문을 a에 하나씩 끼워 넣는 방법"""
-            cands = [make(a['p'] + b['p'], a['d'] + b['d']), make(a['p'] + b['p'], b['d'] + a['d']),
-                     make(b['p'] + a['p'], a['d'] + b['d']), make(b['p'] + a['p'], b['d'] + a['d'])]
-            cur = a
-            for o in b['p']:
-                cur = best_insert(cur, o)
-                if cur is None:
-                    break
-            cands.append(cur)
-            best = None
-            for c in cands:
-                if c is not None and (best is None or score(c) < score(best)):
-                    best = c
-            return best
+            if not p:
+                return None  # 주문이 없어져 빈 번들이 된 경우
 
-        # 가까운 주문 목록: 픽업 거리 + 배달 거리 + 준비시각 차이(거리로 환산)가 작은 10개
-        near = []
-        for i in range(n):
-            order = []
-            for j in range(n):
-                if j != i:
-                    gap = dist[i][j] + dist[i + n][j + n] + abs(ready[i] - ready[j]) * car.speed
-                    order.append((gap, j))
-            order.sort()
-            near.append([j for _, j in order[:10]])
+            d = [o for o in b['d'] if o != i]
+            c = make(p, d)
 
-        def where(sol):
-            """주문 -> 그 주문이 들어 있는 번들의 위치(인덱스)"""
-            pos = [0] * n
-            for k in range(len(sol)):
-                for o in sol[k]['p']:
-                    pos[o] = k
-            return pos
+            # 빈 번들(None)과 실행 불가능한 경로(False)를 구분한다.
+            return False if c is None else c
 
-        def replace(sol, old_idx, new_bundles):
-            """sol에서 old_idx 위치의 번들을 지우고 new_bundles(None 제외)를 추가한 새 해"""
-            new = [sol[k] for k in range(len(sol)) if k not in old_idx]
-            for b in new_bundles:
+        def cheaper(b):
+            # 가능한 라이더 중 더 싼 비용 (끼워 넣기 합치기에서 경로를 고를 때 사용)
+            if b['cc'] is None:
+                return b['cb']
+
+            if b['cb'] is not None and b['cb'] < b['cc']:
+                return b['cb']
+
+            return b['cc']
+
+        def insert_all(A, B):
+            # B의 주문을 픽업 순서대로 A에 하나씩 끼워 넣는다.
+            # 매번 insert가 돌려준 후보 중 더 싼 경로를 고르고, 넣을 수 없으면 None
+            cur = A
+
+            for i in B['p']:
+                options = insert(cur, i)
+
+                if not options:
+                    return None
+
+                cur = options[0]
+
+                for c in options[1:]:
+                    if cheaper(c) < cheaper(cur):
+                        cur = c
+
+            return cur
+
+        def replace(sol, indices, added):
+            # 기존 해를 직접 수정하지 않고 새 리스트를 만든다.
+            new = [
+                sol[k] for k in range(len(sol))
+                if k not in indices
+            ]
+
+            for b in added:
                 if b is not None:
                     new.append(b)
+
             return new
 
-        def merge_pass(sol, cur):
-            """합치기: 총비용이 줄어드는 두 번들을 찾으면 합친다"""
+        def positions(sol):
+            # 주문 번호 -> 해당 주문이 속한 번들의 리스트 위치
+            pos = [0] * n
+
+            for k in range(len(sol)):
+                for i in sol[k]['p']:
+                    pos[i] = k
+
+            return pos
+
+        # 가까운 주문만 이동/교환 대상으로 삼아 탐색 시간을 줄인다.
+        # 거리뿐 아니라 준비 시각의 차이도 함께 고려한다.
+        near = []
+
+        for i in range(n):
+            pairs = []
+
+            for j in range(n):
+                if i != j:
+                    gap = (
+                        dist[i][j]
+                        + dist[i + n][j + n]
+                        + abs(ready[i] - ready[j]) * car.speed
+                    )
+                    pairs.append((gap, j))
+
+            pairs.sort()
+            near.append([j for _, j in pairs[:10]])
+
+        def improve(sol):
+            # 비용이 감소하는 변경 하나를 찾으면 반환한다.
+            # 이후 변경된 해를 기준으로 처음부터 다시 검사한다.
+            current = total(sol)
+            pos = positions(sol)
+
+            # 1. 두 번들의 픽업/배달 순서를 앞뒤로 연결해서 합친다.
             for a in range(len(sol)):
                 for b in range(a + 1, len(sol)):
-                    if time.perf_counter() > end_time:
+                    if time.perf_counter() >= end_time:
                         return None
-                    m = merge(sol[a], sol[b])
-                    if m is None:
-                        continue
-                    new = replace(sol, [a, b], [m])
-                    c = total_cost(new)
-                    if c < cur - 1e-6:
-                        return new, c
-            return None
 
-        def move_pass(sol, cur):
-            """주문 이동: 주문 i를 가까운 주문이 있는 번들 / 자기 번들의 다른 위치 / 혼자 배달로 옮긴다"""
-            pos = where(sol)
+                    A, B = sol[a], sol[b]
+                    pickups = [
+                        A['p'] + B['p'],
+                        B['p'] + A['p']
+                    ]
+                    deliveries = [
+                        A['d'] + B['d'],
+                        B['d'] + A['d']
+                    ]
+
+                    candidates = []
+
+                    for p in pickups:
+                        for d in deliveries:
+                            merged = make(p, d)
+
+                            if merged is not None:
+                                candidates.append(merged)
+
+                    # B의 주문을 A에 하나씩 가장 싼 위치로 끼워 넣어서 합치는 방법도 시도한다.
+                    merged = insert_all(A, B)
+
+                    if merged is not None:
+                        candidates.append(merged)
+
+                    for merged in candidates:
+                        new = replace(sol, [a, b], [merged])
+
+                        if total(new) < current - 1e-6:
+                            return new
+
             for i in range(n):
-                if time.perf_counter() > end_time:
+                if time.perf_counter() >= end_time:
                     return None
+
                 a = pos[i]
                 rest = remove(sol[a], i)
+
                 if rest is False:
                     continue
-                targets = [a]                           # 자기 번들 안에서 위치 바꾸기
+
+                # 2. 자기 번들 안에서 위치를 바꾸거나,
+                # 가까운 주문이 속한 다른 번들로 이동한다.
+                targets = [a]
+
                 for j in near[i]:
                     if pos[j] not in targets:
                         targets.append(pos[j])
-                for b in targets:
-                    if b == a:
-                        new = replace(sol, [a], [best_insert(rest, i)])
-                    else:
-                        nb = best_insert(sol[b], i)
-                        if nb is None:
-                            continue
-                        new = replace(sol, [a, b], [rest, nb])
-                    c = total_cost(new)
-                    if c < cur - 1e-6:
-                        return new, c
-                if rest is not None:                    # 혼자 배달하는 번들로 분리
-                    new = replace(sol, [a], [rest, make([i], [i])])
-                    c = total_cost(new)
-                    if c < cur - 1e-6:
-                        return new, c
-            return None
 
-        def swap_pass(sol, cur):
-            """교환: 서로 다른 번들에 있는 가까운 두 주문 i, j를 맞바꾼다"""
-            pos = where(sol)
-            for i in range(n):
-                if time.perf_counter() > end_time:
-                    return None
+                for b in targets:
+                    target = rest if a == b else sol[b]
+
+                    for candidate in insert(target, i):
+                        if a == b:
+                            new = replace(sol, [a], [candidate])
+                        else:
+                            new = replace(
+                                sol, [a, b], [rest, candidate]
+                            )
+
+                        # BIKE 대수를 반영한 전체 비용으로 비교한다.
+                        if total(new) < current - 1e-6:
+                            return new
+
+                # 3. 주문 i를 혼자 배달하는 번들로 분리한다.
+                if rest is not None:
+                    single = make([i], [i])
+
+                    if single is not None:
+                        new = replace(sol, [a], [rest, single])
+
+                        if total(new) < current - 1e-6:
+                            return new
+
+                # 4. 서로 다른 번들의 주문 i와 j를 교환한다.
                 for j in near[i]:
-                    a, b = pos[i], pos[j]
+                    if time.perf_counter() >= end_time:
+                        return None
+
+                    b = pos[j]
+
                     if a == b:
                         continue
-                    ra = remove(sol[a], i)
-                    rb = remove(sol[b], j)
-                    if ra is False or rb is False:
+
+                    other = remove(sol[b], j)
+
+                    if other is False:
                         continue
-                    na = best_insert(ra, j)
-                    nb = best_insert(rb, i)
-                    if na is None or nb is None:
-                        continue
-                    new = replace(sol, [a, b], [na, nb])
-                    c = total_cost(new)
-                    if c < cur - 1e-6:
-                        return new, c
+
+                    for na in insert(rest, j):
+                        for nb in insert(other, i):
+                            new = replace(sol, [a, b], [na, nb])
+
+                            if total(new) < current - 1e-6:
+                                return new
+
             return None
 
         def local_search(sol):
-            """합치기 -> 이동 -> 교환을 더 이상 좋아지지 않을 때까지 반복"""
-            cur = total_cost(sol)
+            # 개선되는 변경이 없거나 시간이 끝날 때까지 반복한다.
             while time.perf_counter() < end_time:
-                res = merge_pass(sol, cur)
-                if res is None:
-                    res = move_pass(sol, cur)
-                if res is None:
-                    res = swap_pass(sol, cur)
-                if res is None:                         # 세 방법 모두 개선 실패 -> 지역 최적
+                new = improve(sol)
+
+                if new is None:
                     break
-                sol, cur = res
-            return sol, cur
 
-        # 난수 (선형 합동법): 흔들 번들을 고를 때 사용
-        seed = [2026]
+                sol = new
 
-        def rand_int(k):
-            """0 이상 k 미만의 정수 난수"""
-            seed[0] = (seed[0] * 1103515245 + 12345) % 2147483648
-            return (seed[0] // 65536) % k
+            return sol
 
-        def perturb(sol):
-            """흔들기: 무작위 주문 하나와 가까운 주문들이 속한 번들(2~4개)을 1개짜리로 푼다"""
-            pos = where(sol)
-            i = rand_int(n)
-            size = 2 + rand_int(3)
+        def perturb(sol, step):
+            # 시작 주문을 0, 1, ..., n-1 순서로 바꾼다.
+            # 한 바퀴 돌 때마다 분리할 번들 수를 2, 3, 4개로 바꾼다.
+            pos = positions(sol)
+            i = step % n
+            size = 2 + (step // n) % 3
             chosen = [pos[i]]
+
             for j in near[i]:
                 if len(chosen) >= size:
                     break
+
                 if pos[j] not in chosen:
                     chosen.append(pos[j])
+
             singles = []
+
             for k in chosen:
                 for o in sol[k]['p']:
-                    singles.append(make([o], [o]))
-            return replace(sol, chosen, singles)
+                    single = make([o], [o])
 
-        # 1) 초기해 = Savings 해
+                    if single is None:
+                        # 분리할 수 없는 주문을 누락시키지 않는다.
+                        return sol
+
+                    singles.append(single)
+
+            new = replace(sol, chosen, singles)
+
+            if total(new) == float('inf'):
+                return sol
+
+            return new
+
+        # 초기해는 기존 solve_savings의 반환값만 이용한다.
         sav_bundles, _ = self.solve_savings()
+
+        if n == 0:
+            return sav_bundles, []
+
         sol = []
+
         for b in sav_bundles:
-            sol.append(make(list(b.pickups), list(b.deliveries)))
-        sol, cur = local_search(sol)
-        best, best_cost = sol, cur
+            c = make(list(b.pickups), list(b.deliveries))
 
-        # 2) 흔들기 + 지역 탐색 반복
-        #    새 해가 최고 기록보다 1% 이내로만 나쁘면 현재 해로 받아들이고(다른 곳도 탐색),
-        #    그보다 나쁘면 최고 기록 해로 돌아간다
+            if c is None:
+                return sav_bundles, []
+
+            sol.append(c)
+
+        start_sol = local_search(sol)       # 모든 탐색의 공통 출발점
+        best, best_cost = start_sol, total(start_sol)       # 전체 최고 기록
+        run_best, run_cost = best, best_cost                # 이번 탐색의 최고 기록
+        sol = start_sol
+        step = 0
+        offset = 0          # 이번 탐색에서 흔들기를 시작하는 주문 번호
+        last_improve = time.perf_counter()
+
         while time.perf_counter() < end_time:
-            new, new_cost = local_search(perturb(sol))
-            if new_cost < best_cost - 1e-6:
-                best, best_cost = new, new_cost
-            if new_cost <= best_cost * 1.01:
-                sol, cur = new, new_cost
-            else:
-                sol, cur = best, best_cost
+            new = local_search(perturb(sol, offset + step))
+            step += 1
+            cost = total(new)
 
-        # 3) 라이더 배정 (Savings의 E 단계와 같은 규칙) 후 Bundle로 변환
-        result = []
+            if cost < run_cost - 1e-6:
+                run_best, run_cost = new, cost
+                last_improve = time.perf_counter()
+
+            if cost < best_cost - 1e-6:
+                best, best_cost = new, cost
+
+            # 약간 나쁜 해도 다음 탐색의 출발점으로 허용한다.
+            # 이번 탐색의 최고 기록보다 1% 넘게 나쁘면 그 기록으로 돌아간다.
+            sol = new if cost <= run_cost * 1.01 else run_best
+
+            # 30초 동안 이번 탐색의 기록이 안 바뀌면 탐색이 멈춘 것으로 보고,
+            # 처음 해로 돌아가 흔들기 시작 위치를 n/3만큼 옮겨 새로 탐색한다.
+            if time.perf_counter() - last_improve > 30:
+                offset += n // 3 + 1
+                step = 0
+                sol = start_sol
+                run_best, run_cost = start_sol, total(start_sol)
+                last_improve = time.perf_counter()
+
+        # 반환 직전에 주문 누락/중복, 경로, 비용, BIKE 대수를 검증한다.
+        counts = [0] * n
+
         for b in best:
-            result.append(Bundle(min(b['p']), b['p'], b['d']))
-        result.sort(key=lambda x: x.bundle_id)
-        info = {}
-        forced = []                                     # CAR로 불가능 -> 반드시 BIKE
-        cand = []
+            if not b['p'] or sorted(b['p']) != sorted(b['d']):
+                return sav_bundles, []
+
+            for i in b['p']:
+                if i < 0 or i >= n:
+                    return sav_bundles, []
+
+                counts[i] += 1
+
+            if make(b['p'], b['d']) != b:
+                return sav_bundles, []
+
+        if any(c != 1 for c in counts) or total(best) == float('inf'):
+            return sav_bundles, []
+
+        # 실제 라이더 배정: 필수 BIKE부터 배정하고 절약액 순으로 추가 배정.
+        forced, gains = [], []
+
         for b in best:
             bid = min(b['p'])
-            info[bid] = b
+
             if b['cc'] is None:
                 forced.append(bid)
             elif b['cb'] is not None and b['cb'] < b['cc']:
-                cand.append((-(b['cc'] - b['cb']), bid))
-        cand.sort()
-        bike_ids = forced + [bid for _, bid in cand[:bike.available - len(forced)]]
-        for b in result:
-            if b.bundle_id in bike_ids:
-                b.rider_type, b.cost = 'BIKE', info[b.bundle_id]['cb']
-            else:
-                b.rider_type, b.cost = 'CAR', info[b.bundle_id]['cc']
-        # 안전장치: Savings보다 나쁘면 Savings 해를 반환
+                gains.append((-(b['cc'] - b['cb']), bid))
+
+        # 절약액 내림차순, 동률이면 번들 번호 오름차순.
+        gains.sort()
+        bike_ids = forced + [
+            bid for _, bid in gains[:bike.available - len(forced)]
+        ]
+
+        result = []
+
+        for b in best:
+            bid = min(b['p'])
+            item = Bundle(bid, b['p'][:], b['d'][:])
+            item.rider_type = 'BIKE' if bid in bike_ids else 'CAR'
+            item.cost = b['cb'] if bid in bike_ids else b['cc']
+            result.append(item)
+
+        # Savings보다 나빠졌다면 원래 Savings 결과를 반환한다.
         if sum(b.cost for b in result) > sum(b.cost for b in sav_bundles) + 1e-6:
             return sav_bundles, []
+
+        result.sort(key=lambda b: b.bundle_id)
         return result, []
 
     def run(self, input_file, algorithm, output_file):
